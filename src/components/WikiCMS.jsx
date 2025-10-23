@@ -1,10 +1,41 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Send, Loader2, MessageSquare, Book } from 'lucide-react';
 
 export default function WikiCMS() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const messagesEndRef = useRef(null);
+
+  // API URL - empty string for production (same origin), localhost for development
+  const API_URL = import.meta.env.MODE === 'development' ? 'http://localhost:3001' : '';
+
+  // Auto-scroll to bottom whenever messages change
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  // Claude-powered keyword extraction
+  const extractKeywordsWithClaude = async (query) => {
+    try {
+      const response = await fetch(`${API_URL}/api/extract-keywords`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query })
+      });
+      const data = await response.json();
+      return data.keywords || query;
+    } catch (error) {
+      console.error('Keyword extraction error:', error);
+      return query; // Fallback to original query
+    }
+  };
 
   const searchWikipedia = async (query) => {
     try {
@@ -48,7 +79,12 @@ export default function WikiCMS() {
     setLoading(true);
 
     try {
-      const articles = await searchWikipedia(userMessage);
+      // Use Claude to extract keywords
+      console.log('Original query:', userMessage);
+      const keywords = await extractKeywordsWithClaude(userMessage);
+      console.log('Claude extracted keywords:', keywords);
+      
+      const articles = await searchWikipedia(keywords);
       
       if (!articles || articles.length === 0) {
         setMessages(prev => [...prev, { 
@@ -59,20 +95,70 @@ export default function WikiCMS() {
         return;
       }
 
-      let response = 'Here is what I found on Wikipedia:\n\n';
-      articles.forEach((article) => {
-        response += `${article.title}\n${article.extract}\n\n`;
-      });
-
+      const assistantMessageIndex = messages.length + 1;
       setMessages(prev => [...prev, { 
         role: 'assistant', 
-        content: response,
-        sources: articles
+        content: '',
+        sources: articles,
+        articlesUsed: articles.length,
+        streaming: true
       }]);
+
+      const response = await fetch(`${API_URL}/api/chat/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: userMessage,
+          articles: articles
+        })
+      });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulatedText = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = JSON.parse(line.slice(6));
+            
+            if (data.text) {
+              accumulatedText += data.text;
+              setMessages(prev => prev.map((msg, idx) => 
+                idx === assistantMessageIndex 
+                  ? { ...msg, content: accumulatedText }
+                  : msg
+              ));
+            }
+            
+            if (data.done) {
+              setMessages(prev => prev.map((msg, idx) => 
+                idx === assistantMessageIndex 
+                  ? { ...msg, streaming: false }
+                  : msg
+              ));
+            }
+
+            if (data.error) {
+              throw new Error(data.error);
+            }
+          }
+        }
+      }
+
     } catch (error) {
+      console.error('Error:', error);
       setMessages(prev => [...prev, { 
         role: 'error', 
-        content: 'Error: ' + error.message
+        content: 'Sorry, I encountered an error. Please try again.'
       }]);
     } finally {
       setLoading(false);
@@ -94,8 +180,8 @@ export default function WikiCMS() {
           <div className="flex items-center gap-3">
             <Book className="w-8 h-8" />
             <div>
-              <h1 className="text-2xl font-bold">Wikipedia Chat</h1>
-              <p className="text-sm text-indigo-200">Search Wikipedia</p>
+              <h1 className="text-2xl font-bold">Wikipedia Chat with AI</h1>
+              <p className="text-sm text-indigo-200">Powered by Claude & Wikipedia</p>
             </div>
           </div>
         </div>
@@ -105,23 +191,31 @@ export default function WikiCMS() {
             <div className="text-center text-gray-500 mt-20">
               <MessageSquare className="w-16 h-16 mx-auto mb-4 text-gray-300" />
               <h2 className="text-xl font-semibold mb-2">Welcome!</h2>
-              <p className="text-sm">Ask me anything</p>
+              <p className="text-sm mb-4">Ask me anything in natural language</p>
+              <div className="space-y-2 text-sm text-left max-w-md mx-auto">
+                <p className="bg-gray-50 p-3 rounded-lg">Tell me about the Apollo 11 moon landing</p>
+                <p className="bg-gray-50 p-3 rounded-lg">What is quantum computing?</p>
+                <p className="bg-gray-50 p-3 rounded-lg">Who was Marie Curie?</p>
+              </div>
             </div>
           )}
           
           {messages.map((msg, idx) => (
             <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-4/5 rounded-lg p-4 ${
+              <div className={`max-w-[85%] rounded-lg p-4 ${
                 msg.role === 'user' 
                   ? 'bg-indigo-600 text-white' 
                   : msg.role === 'error'
                   ? 'bg-red-100 text-red-800'
                   : 'bg-gray-100 text-gray-800'
               }`}>
-                <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
-                {msg.sources && msg.sources.length > 0 && (
+                <p className="text-sm whitespace-pre-wrap leading-relaxed">
+                  {msg.content}
+                  {msg.streaming && <span className="inline-block w-1 h-4 ml-1 bg-gray-700 animate-pulse"></span>}
+                </p>
+                {msg.sources && msg.sources.length > 0 && !msg.streaming && (
                   <div className="mt-3 pt-3 border-t border-gray-300">
-                    <p className="text-xs font-bold mb-2">Sources:</p>
+                    <p className="text-xs font-bold mb-2">📚 Sources:</p>
                     {msg.sources.map((source, i) => (
                       <a
                         key={i}
@@ -135,6 +229,11 @@ export default function WikiCMS() {
                     ))}
                   </div>
                 )}
+                {msg.articlesUsed !== undefined && !msg.streaming && (
+                  <p className="text-xs mt-2 opacity-70">
+                    ✨ AI-powered answer using {msg.articlesUsed} Wikipedia article{msg.articlesUsed !== 1 ? 's' : ''}
+                  </p>
+                )}
               </div>
             </div>
           ))}
@@ -143,17 +242,19 @@ export default function WikiCMS() {
             <div className="flex justify-start">
               <div className="bg-gray-100 rounded-lg p-4 flex items-center gap-2">
                 <Loader2 className="w-5 h-5 animate-spin text-indigo-600" />
-                <span className="text-sm text-gray-600">Searching...</span>
+                <span className="text-sm text-gray-600">Searching Wikipedia...</span>
               </div>
             </div>
           )}
+          
+          <div ref={messagesEndRef} />
         </div>
 
         <div className="p-6 bg-gray-50 border-t">
           <div className="flex gap-2">
             <input
               type="text"
-              placeholder="Ask a question"
+              placeholder="Ask me anything..."
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyPress={handleKeyPress}
@@ -168,9 +269,13 @@ export default function WikiCMS() {
               <Send className="w-5 h-5" />
             </button>
           </div>
+          <p className="text-xs text-gray-500 mt-2">
+            Powered by Claude AI + Wikipedia
+          </p>
         </div>
 
       </div>
     </div>
   );
 }
+
